@@ -254,18 +254,8 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
           console.log('Recording stopped. File path:', finalPath);
         }
         
-        // Automatically transcribe after recording stops (Android only for now)
-        if (Platform.OS === 'android') {
-          await transcribeAudio(finalPath);
-        } else {
-          // iOS: Show message that transcription is Android-only for now
-          console.log('iOS recording saved. Transcription is currently Android-only.');
-          Alert.alert(
-            'Recording Saved',
-            'Your recording has been saved. Transcription is currently only available on Android. iOS support coming soon!',
-            [{ text: 'OK' }]
-          );
-        }
+        // Automatically transcribe after recording stops
+        await transcribeAudio(finalPath);
       } else {
         console.error('No audio path available after stopping recording');
         Alert.alert('Error', 'Could not determine audio file path');
@@ -283,18 +273,32 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
     const startTime = Date.now();
 
     try {
-      // Check if we're on iOS - Vosk module is Android-only for now
-      if (Platform.OS === 'ios') {
-        throw new Error('Transcription is currently only available on Android. iOS transcription support coming soon.');
-      }
-      
       // Import native module dynamically (lazy load for better initial performance)
       // Use require instead of dynamic import to avoid module initialization issues
       const ReactNative = require('react-native');
-      const VoskFileRecognition = ReactNative.NativeModules?.VoskFileRecognition;
+      const { NativeModules } = ReactNative;
+      
+      // Log available modules for debugging (dev mode only)
+      if (__DEV__) {
+        const moduleKeys = Object.keys(NativeModules || {});
+        console.log('Available native modules:', moduleKeys);
+        console.log('Looking for: VoskFileRecognition');
+        
+        // Try alternative names
+        if (NativeModules?.VoskFileRecognitionModule) {
+          console.log('Found VoskFileRecognitionModule (with Module suffix)');
+        }
+      }
+      
+      // Try both possible module names
+      const VoskFileRecognition = NativeModules?.VoskFileRecognition || NativeModules?.VoskFileRecognitionModule;
 
       if (!VoskFileRecognition) {
-        throw new Error('Vosk native module not found. Please rebuild the app.');
+        const availableModules = Object.keys(NativeModules || {}).join(', ');
+        const errorMsg = Platform.OS === 'ios' 
+          ? `Vosk native module not found. Available modules: [${availableModules || 'none'}]. Please ensure:\n1. VoskFileRecognitionModule.swift is added to Xcode project with target membership\n2. VoskFileRecognitionModule.m is added to Xcode project with target membership\n3. Clean build folder and rebuild (Shift+Cmd+K, then Cmd+B)\n4. Check Xcode build log for compilation errors`
+          : 'Vosk native module not found. Please rebuild the app.';
+        throw new Error(errorMsg);
       }
 
       // Model path in assets/bundle
@@ -310,7 +314,10 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
         cleanAudioPath = cleanAudioPath.replace(/^file:\/\/+/, '');
       }
       // Fix double slashes at the start (e.g., //storage -> /storage)
-      cleanAudioPath = cleanAudioPath.replace(/^\/+/, '/');
+      // On iOS, keep the path as-is if it's already absolute
+      if (Platform.OS === 'android') {
+        cleanAudioPath = cleanAudioPath.replace(/^\/+/, '/');
+      }
 
       console.log('Cleaned audio path:', cleanAudioPath);
 

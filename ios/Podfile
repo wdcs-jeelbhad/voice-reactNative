@@ -23,6 +23,9 @@ target 'voice' do
     :app_path => "#{Pod::Config.instance.installation_root}/.."
   )
 
+  # iOS uses Apple's native Speech framework (built-in, no pod needed)
+  # This provides offline speech recognition capabilities
+
   post_install do |installer|
     # https://github.com/facebook/react-native/blob/main/packages/react-native/scripts/react_native_pods.rb#L197-L202
     react_native_post_install(
