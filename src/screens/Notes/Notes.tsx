@@ -73,25 +73,28 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
   }, []);
 
   const requestAudioPermission = async () => {
-    if (Platform.OS !== 'android') {
+    if (Platform.OS === 'android') {
+      try {
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+          {
+            title: 'Microphone Permission',
+            message: 'This app needs access to your microphone to record audio.',
+            buttonNeutral: 'Ask Me Later',
+            buttonNegative: 'Cancel',
+            buttonPositive: 'OK',
+          }
+        );
+        return granted === PermissionsAndroid.RESULTS.GRANTED;
+      } catch (err) {
+        console.warn('Permission request error:', err);
+        return false;
+      }
+    } else {
+      // iOS: Permissions are handled automatically via Info.plist
+      // The native module will request permission when starting recording
+      // We just need to check if we can proceed
       return true;
-    }
-
-    try {
-      const granted = await PermissionsAndroid.request(
-        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-        {
-          title: 'Microphone Permission',
-          message: 'This app needs access to your microphone to record audio.',
-          buttonNeutral: 'Ask Me Later',
-          buttonNegative: 'Cancel',
-          buttonPositive: 'OK',
-        }
-      );
-      return granted === PermissionsAndroid.RESULTS.GRANTED;
-    } catch (err) {
-      console.warn('Permission request error:', err);
-      return false;
     }
   };
 
@@ -126,61 +129,96 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
           AudioEncodingBitRateAndroid: 256000, // 16kHz * 16-bit = 256kbps
         };
       } else {
-        // iOS: Record as Linear PCM (WAV format) for Vosk
+        // iOS: Use just filename - library handles the path internally
+        // iOS prefers .m4a format, but we'll try .wav first
         const timestamp = Date.now();
-        path = `note_${timestamp}.wav`;
-        
-        audioSet = {
-          AVFormatIDKeyIOS: 'lpcm' as const, // Linear PCM
-          AVSampleRateKeyIOS: 16000, // 16kHz for Vosk
-          AVNumberOfChannelsKeyIOS: 1, // Mono
-          AVLinearPCMBitDepthKeyIOS: 16, // 16-bit
-          AVLinearPCMIsBigEndianKeyIOS: false, // Little endian
-          AVLinearPCMIsFloatKeyIOS: false, // Integer PCM
-          AVEncoderAudioQualityKeyIOS: AVEncoderAudioQualityIOSType.high,
-        };
+        path = `note_${timestamp}.m4a`;
+        // Don't set audioSet for iOS - let it use defaults first
+        audioSet = undefined;
       }
 
-      // Log to verify audioSet is being created
+      // Log to verify configuration
       console.log('Starting recorder with audioSet:', JSON.stringify(audioSet));
       console.log('Platform:', Platform.OS);
       console.log('Path:', path);
 
-      // For iOS, try with minimal config or undefined
-      // Version 3.x sometimes works better without explicit audioSet on iOS
+      // Start recording with platform-specific handling
       if (Platform.OS === 'ios') {
-        // Try with minimal config first
-        const result = await player.startRecorder(path, audioSet);
-        console.log('iOS recording started, result:', result);
+        // iOS: Try with no config first (most compatible)
+        let recordingStarted = false;
+        let actualPath = path;
+        
+        try {
+          // First try: No audioSet at all (default iOS settings)
+          const result = await player.startRecorder(path, undefined);
+          actualPath = result || path;
+          console.log('iOS recording started with default settings, result:', result);
+          recordingStarted = true;
+        } catch (defaultError: any) {
+          console.warn('iOS default recording failed, trying with audioSet:', defaultError?.message);
+          
+          // Second try: With minimal audioSet
+          try {
+            const minimalAudioSet: AudioSet = {
+              AVSampleRateKeyIOS: 16000,
+              AVNumberOfChannelsKeyIOS: 1,
+            };
+            const result = await player.startRecorder(path, minimalAudioSet);
+            actualPath = result || path;
+            console.log('iOS recording started with minimal config, result:', result);
+            recordingStarted = true;
+          } catch (minimalError: any) {
+            console.warn('iOS minimal config failed, trying with quality setting:', minimalError?.message);
+            
+            // Third try: With quality setting
+            try {
+              const qualityAudioSet: AudioSet = {
+                AVEncoderAudioQualityKeyIOS: AVEncoderAudioQualityIOSType.high,
+              };
+              const result = await player.startRecorder(path, qualityAudioSet);
+              actualPath = result || path;
+              console.log('iOS recording started with quality config, result:', result);
+              recordingStarted = true;
+            } catch (qualityError: any) {
+              console.error('All iOS recording attempts failed:', qualityError);
+              throw qualityError;
+            }
+          }
+        }
+        
+        if (!recordingStarted) {
+          throw new Error('Failed to start iOS recording with any configuration');
+        }
+        
+        // Add record back listener for iOS (prevents "no listeners" warning)
+        try {
+          player.addRecordBackListener((e: any) => {
+            // iOS recording progress callback
+            // We can use this for UI updates if needed
+            console.log('Recording progress:', e.currentPosition, e.duration);
+          });
+        } catch (listenerError) {
+          console.warn('Could not add record back listener:', listenerError);
+        }
+        
+        // Only set state after successful recording start
+        setIsRecording(true);
+        setAudioPath(actualPath);
       } else {
-        // Android: use full audioSet
+        // Android: use full audioSet (unchanged - working correctly)
         await player.startRecorder(path, audioSet);
+        setIsRecording(true);
+        setAudioPath(path);
       }
-
-      setIsRecording(true);
-      setAudioPath(path);
     } catch (error: any) {
       console.error('Error starting recording:', error);
       console.error('Error message:', error?.message);
       console.error('Error stack:', error?.stack);
       
-      // For iOS, if the error persists, try without audioSet
-      if (Platform.OS === 'ios' && error?.message?.includes('initiating recorder')) {
-        try {
-          console.log('Retrying iOS recording without audioSet...');
-          const player = getAudioRecorderPlayer();
-          if (player) {
-            await player.startRecorder(path, undefined);
-            setIsRecording(true);
-            setAudioPath(path);
-            return;
-          }
-        } catch (retryError) {
-          console.error('Retry also failed:', retryError);
-        }
-      }
-      
-      Alert.alert('Recording Error', `Failed to start recording: ${error?.message || error}`);
+      Alert.alert(
+        'Recording Error', 
+        `Failed to start recording: ${error?.message || error}\n\nPlease ensure microphone permission is granted in Settings.`
+      );
     }
   };
 
@@ -201,15 +239,33 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
       
       // Ensure we have a valid path
       if (finalPath) {
-        // Remove any file:// prefix that might be added
-        finalPath = finalPath.replace(/^file:\/\//, '');
-        // Fix double slashes at the start
-        finalPath = finalPath.replace(/^\/+/, '/');
-        setAudioPath(finalPath);
-        console.log('Recording stopped. File path:', finalPath);
+        // Platform-specific path handling
+        if (Platform.OS === 'ios') {
+          // iOS: Store the path exactly as returned by stopRecorder()
+          // This is the path the player expects for playback
+          // Don't modify it - use it as-is for playback
+          setAudioPath(finalPath);
+          console.log('Recording stopped. File path (iOS, stored as-is):', finalPath);
+        } else {
+          // Android: Remove file:// prefix and fix slashes
+          finalPath = finalPath.replace(/^file:\/\//, '');
+          finalPath = finalPath.replace(/^\/+/, '/');
+          setAudioPath(finalPath);
+          console.log('Recording stopped. File path:', finalPath);
+        }
         
-        // Automatically transcribe after recording stops
-        await transcribeAudio(finalPath);
+        // Automatically transcribe after recording stops (Android only for now)
+        if (Platform.OS === 'android') {
+          await transcribeAudio(finalPath);
+        } else {
+          // iOS: Show message that transcription is Android-only for now
+          console.log('iOS recording saved. Transcription is currently Android-only.');
+          Alert.alert(
+            'Recording Saved',
+            'Your recording has been saved. Transcription is currently only available on Android. iOS support coming soon!',
+            [{ text: 'OK' }]
+          );
+        }
       } else {
         console.error('No audio path available after stopping recording');
         Alert.alert('Error', 'Could not determine audio file path');
@@ -227,9 +283,15 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
     const startTime = Date.now();
 
     try {
+      // Check if we're on iOS - Vosk module is Android-only for now
+      if (Platform.OS === 'ios') {
+        throw new Error('Transcription is currently only available on Android. iOS transcription support coming soon.');
+      }
+      
       // Import native module dynamically (lazy load for better initial performance)
-      const { NativeModules } = await import('react-native');
-      const VoskFileRecognition = NativeModules.VoskFileRecognition;
+      // Use require instead of dynamic import to avoid module initialization issues
+      const ReactNative = require('react-native');
+      const VoskFileRecognition = ReactNative.NativeModules?.VoskFileRecognition;
 
       if (!VoskFileRecognition) {
         throw new Error('Vosk native module not found. Please rebuild the app.');
@@ -322,23 +384,71 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
   };
 
   const playRecording = async () => {
-    if (!audioPath) return;
+    if (!audioPath) {
+      Alert.alert('No Recording', 'No audio file available to play.');
+      return;
+    }
 
     try {
       const player = getAudioRecorderPlayer();
       if (!player) {
         console.error('AudioRecorderPlayer not available');
+        Alert.alert('Playback Error', 'Audio player not available.');
         return;
       }
-      await player.startPlayer(audioPath);
+
+      // Format path for playback (platform-specific)
+      let playPath = audioPath;
+      
+      if (Platform.OS === 'ios') {
+        // iOS: Use path exactly as stored (from stopRecorder result)
+        // The library handles the path format internally
+        playPath = audioPath;
+        console.log('iOS: Playing audio from stored path:', playPath);
+      } else {
+        // Android: Remove file:// if present, player handles it (unchanged)
+        playPath = playPath.replace(/^file:\/\//, '');
+        console.log('Android: Playing audio from path:', playPath);
+      }
+
+      // Verify file exists before playing (remove file:// for check)
+      const pathForCheck = playPath.replace(/^file:\/\//, '');
+      const fileExists = await RNFS.exists(pathForCheck);
+      if (!fileExists) {
+        Alert.alert('File Not Found', `Audio file not found at: ${pathForCheck}`);
+        console.error('Audio file does not exist:', pathForCheck);
+        return;
+      }
+
+      // Stop any existing playback first
+      try {
+        await player.stopPlayer();
+        player.removePlayBackListener();
+      } catch (stopError) {
+        // Ignore if nothing was playing
+        console.log('No previous playback to stop');
+      }
+      
+      // Start playback - use path exactly as stored for iOS
+      const result = await player.startPlayer(playPath);
+      console.log('Playback started, result:', result);
+      
+      // Add playback listener
       player.addPlayBackListener((e: PlayBackType) => {
+        console.log('Playback progress:', e.currentPosition, '/', e.duration);
         if (e.currentPosition >= e.duration) {
           player.stopPlayer();
           player.removePlayBackListener();
+          console.log('Playback finished');
         }
       });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error playing recording:', error);
+      console.error('Error details:', error?.message, error?.stack);
+      Alert.alert(
+        'Playback Error', 
+        `Failed to play recording: ${error?.message || 'Unknown error'}\n\nPath: ${audioPath}`
+      );
     }
   };
 
