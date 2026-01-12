@@ -4,11 +4,13 @@ import React, { useState, useRef, useEffect } from 'react';
 import {
   View,
   Text,
+  TextInput,
   TouchableOpacity,
   StyleSheet,
   Platform,
   PermissionsAndroid,
   Alert,
+  KeyboardAvoidingView,
 } from 'react-native';
 
 import { Paths } from '@/navigation/paths';
@@ -34,6 +36,8 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
   const [transcription, setTranscription] = useState<string | null>(null);
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
+  const [noteText, setNoteText] = useState<string>('');
+  const textInputRef = useRef<TextInput>(null);
 
   // Initialize AudioRecorderPlayer using useRef for lazy initialization
   // Version 3.x doesn't use Nitro modules, so simple initialization works
@@ -273,6 +277,21 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
         if (transcribedText.length > 0) {
           setTranscription(transcribedText);
           console.log('Transcription successful:', transcribedText);
+          
+          // Append transcription to note text
+          // If noteText is empty, set it; otherwise append with a space
+          setNoteText((prevText) => {
+            if (prevText.trim().length === 0) {
+              return transcribedText;
+            }
+            // Append with proper spacing
+            return `${prevText} ${transcribedText}`;
+          });
+          
+          // Focus the text input to show the new transcription
+          setTimeout(() => {
+            textInputRef.current?.focus();
+          }, 100);
         } else {
           console.warn('Transcription returned empty text');
           setTranscription('No speech detected in the recording.');
@@ -316,51 +335,82 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
 
   return (
     <SafeScreen>
-      <View style={[layout.flex_1, styles.container]}>
-        <Text style={styles.title}>Voice Notes</Text>
+      <KeyboardAvoidingView
+        style={[layout.flex_1]}
+        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 90 : 0}>
+        <View style={[layout.flex_1, styles.container]}>
+          <Text style={styles.title}>Voice Notes</Text>
 
-        <TouchableOpacity
-          style={[
-            styles.button,
-            isRecording ? styles.stopButton : styles.recordButton,
-          ]}
-          onPress={isRecording ? stopRecording : startRecording}>
-          <Text style={styles.buttonText}>
-            {isRecording ? 'Stop Recording' : 'Start Recording'}
-          </Text>
-        </TouchableOpacity>
+          {/* Recording Controls */}
+          <View style={styles.controlsContainer}>
+            <TouchableOpacity
+              style={[
+                styles.button,
+                isRecording ? styles.stopButton : styles.recordButton,
+              ]}
+              onPress={isRecording ? stopRecording : startRecording}>
+              <Text style={styles.buttonText}>
+                {isRecording ? 'Stop Recording' : 'Start Recording'}
+              </Text>
+            </TouchableOpacity>
 
-        {audioPath && (
-          <TouchableOpacity style={styles.playButton} onPress={playRecording}>
-            <Text style={styles.buttonText}>Play Last Recording</Text>
-          </TouchableOpacity>
-        )}
-
-        {isTranscribing && (
-          <View style={styles.transcribingContainer}>
-            <Text style={styles.transcribingText}>🔄 Transcribing audio...</Text>
+            {audioPath && (
+              <TouchableOpacity style={styles.playButton} onPress={playRecording}>
+                <Text style={styles.buttonText}>Play Last Recording</Text>
+              </TouchableOpacity>
+            )}
           </View>
-        )}
 
-        {transcription && (
-          <View style={styles.transcriptionContainer}>
-            <Text style={styles.transcriptionLabel}>📝 Transcription:</Text>
-            <Text style={styles.transcriptionText}>{transcription}</Text>
+          {/* Status Messages */}
+          {isTranscribing && (
+            <View style={styles.transcribingContainer}>
+              <Text style={styles.transcribingText}>🔄 Transcribing audio...</Text>
+            </View>
+          )}
+
+          {transcriptionError && (
+            <View style={styles.errorContainer}>
+              <Text style={styles.errorText}>❌ {transcriptionError}</Text>
+            </View>
+          )}
+
+          {/* Multiline Text Input for Notes */}
+          <View style={styles.textInputContainer}>
+            <Text style={styles.textInputLabel}>📝 Your Notes:</Text>
+            <TextInput
+              ref={textInputRef}
+              style={styles.textInput}
+              value={noteText}
+              onChangeText={setNoteText}
+              placeholder="Start recording or type your notes here..."
+              placeholderTextColor="#9ca3af"
+              multiline={true}
+              textAlignVertical="top"
+              scrollEnabled={true}
+              returnKeyType="default"
+              blurOnSubmit={false}
+              autoCapitalize="sentences"
+              autoCorrect={true}
+              spellCheck={true}
+              keyboardType="default"
+            />
+            {noteText.length > 0 && (
+              <Text style={styles.characterCount}>
+                {noteText.length} {noteText.length === 1 ? 'character' : 'characters'}
+              </Text>
+            )}
           </View>
-        )}
 
-        {transcriptionError && (
-          <View style={styles.errorContainer}>
-            <Text style={styles.errorText}>❌ {transcriptionError}</Text>
-          </View>
-        )}
+       
 
-        {audioPath && (
-          <Text style={styles.pathText} numberOfLines={2}>
-            💾 Saved at: {audioPath}
-          </Text>
-        )}
-      </View>
+          {audioPath && (
+            <Text style={styles.pathText} numberOfLines={1}>
+              💾 Saved at: {audioPath.split('/').pop()}
+            </Text>
+          )}
+        </View>
+      </KeyboardAvoidingView>
     </SafeScreen>
   );
 }
@@ -369,19 +419,32 @@ export default Notes;
 
 const styles = StyleSheet.create({
   container: {
-    padding: 20,
-    justifyContent: 'center',
+    padding: 16,
+    flex: 1,
   },
   title: {
-    fontSize: 20,
-    fontWeight: '600',
-    marginBottom: 30,
+    fontSize: 24,
+    fontWeight: '700',
+    marginBottom: 20,
     textAlign: 'center',
+    color: '#111827',
+  },
+  controlsContainer: {
+    marginBottom: 16,
   },
   button: {
     padding: 16,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: 'center',
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 3,
   },
   recordButton: {
     backgroundColor: '#2563eb',
@@ -390,26 +453,27 @@ const styles = StyleSheet.create({
     backgroundColor: '#dc2626',
   },
   playButton: {
-    marginTop: 20,
     backgroundColor: '#16a34a',
     padding: 16,
-    borderRadius: 10,
+    borderRadius: 12,
     alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 3,
   },
   buttonText: {
     color: '#fff',
     fontSize: 16,
-    fontWeight: '500',
-  },
-  pathText: {
-    marginTop: 16,
-    fontSize: 12,
-    color: '#6b7280',
-    textAlign: 'center',
+    fontWeight: '600',
   },
   transcribingContainer: {
-    marginTop: 20,
-    padding: 16,
+    marginBottom: 16,
+    padding: 12,
     backgroundColor: '#f0f9ff',
     borderRadius: 10,
     borderWidth: 1,
@@ -421,28 +485,75 @@ const styles = StyleSheet.create({
     color: '#0369a1',
     fontWeight: '500',
   },
-  transcriptionContainer: {
-    marginTop: 20,
-    padding: 16,
+  textInputContainer: {
+    flex: 1,
+    marginBottom: 16,
+    backgroundColor: '#ffffff',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e5e7eb',
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 1,
+    },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    elevation: 2,
+    overflow: 'hidden',
+  },
+  textInputLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#374151',
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 8,
+    backgroundColor: '#f9fafb',
+    borderBottomWidth: 1,
+    borderBottomColor: '#e5e7eb',
+  },
+  textInput: {
+    flex: 1,
+    fontSize: 16,
+    color: '#111827',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    minHeight: 200,
+    lineHeight: 24,
+  },
+  characterCount: {
+    fontSize: 12,
+    color: '#6b7280',
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+    textAlign: 'right',
+    backgroundColor: '#f9fafb',
+    borderTopWidth: 1,
+    borderTopColor: '#e5e7eb',
+  },
+  transcriptionPreviewContainer: {
+    marginBottom: 12,
+    padding: 12,
     backgroundColor: '#f0fdf4',
     borderRadius: 10,
     borderWidth: 1,
     borderColor: '#86efac',
   },
-  transcriptionLabel: {
-    fontSize: 14,
+  transcriptionPreviewLabel: {
+    fontSize: 12,
     fontWeight: '600',
     color: '#166534',
-    marginBottom: 8,
+    marginBottom: 4,
   },
-  transcriptionText: {
-    fontSize: 16,
+  transcriptionPreviewText: {
+    fontSize: 14,
     color: '#15803d',
-    lineHeight: 24,
+    lineHeight: 20,
   },
   errorContainer: {
-    marginTop: 20,
-    padding: 16,
+    marginBottom: 16,
+    padding: 12,
     backgroundColor: '#fef2f2',
     borderRadius: 10,
     borderWidth: 1,
@@ -451,6 +562,12 @@ const styles = StyleSheet.create({
   errorText: {
     fontSize: 14,
     color: '#991b1b',
+    textAlign: 'center',
+  },
+  pathText: {
+    marginTop: 8,
+    fontSize: 11,
+    color: '#9ca3af',
     textAlign: 'center',
   },
 });
