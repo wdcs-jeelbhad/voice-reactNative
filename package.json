@@ -13,7 +13,8 @@
     "lint": "yarn lint:rules && yarn lint:code-format && yarn lint:type-check",
     "lint:fix": "yarn lint:rules --fix && yarn lint:code-format --write && yarn lint:type-check",
     "test:report": "jest --collectCoverage --coverageDirectory=\"./coverage\" --ci --reporters=default --reporters=jest-junit --coverage",
-    "pod-install": "npx pod-install"
+    "pod-install": "npx pod-install",
+    "extract-jna": "./extract-jna-libs.sh"
   },
   "dependencies": {
     "@react-native-masked-view/masked-view": "^0.3.2",

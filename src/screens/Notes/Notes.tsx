@@ -18,6 +18,7 @@ import { SafeScreen } from '@/components/templates';
 import AudioRecorderPlayer, {
   AudioSourceAndroidType,
   AudioEncoderAndroidType,
+  OutputFormatAndroidType,
   AVEncoderAudioQualityIOSType,
   AudioSet,
   type PlayBackType,
@@ -30,6 +31,9 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
 
   const [isRecording, setIsRecording] = useState(false);
   const [audioPath, setAudioPath] = useState<string | null>(null);
+  const [transcription, setTranscription] = useState<string | null>(null);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
 
   // Initialize AudioRecorderPlayer using useRef for lazy initialization
   // Version 3.x doesn't use Nitro modules, so simple initialization works
@@ -106,26 +110,29 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
       let audioSet: AudioSet | undefined;
 
       if (Platform.OS === 'android') {
-        path = `${RNFS.ExternalDirectoryPath}/note_${Date.now()}.mp3`;
+        // Record in WAV/PCM format for Vosk compatibility
+        // Vosk requires: 16kHz, mono, 16-bit PCM
+        path = `${RNFS.ExternalDirectoryPath}/note_${Date.now()}.wav`;
         audioSet = {
-          // Android-specific configuration
           AudioSourceAndroid: AudioSourceAndroidType.MIC,
-          AudioEncoderAndroid: AudioEncoderAndroidType.AAC,
-          AudioSamplingRateAndroid: 44100,
-          AudioEncodingBitRateAndroid: 128000,
+          OutputFormatAndroid: OutputFormatAndroidType.WAVE, // WAV format
+          AudioEncoderAndroid: AudioEncoderAndroidType.PCM_16BIT, // 16-bit PCM
+          AudioSamplingRateAndroid: 16000, // Vosk recommended: 16kHz
+          AudioChannelsAndroid: 1, // Mono
+          AudioEncodingBitRateAndroid: 256000, // 16kHz * 16-bit = 256kbps
         };
       } else {
-        // iOS: Based on the Swift implementation, paths are handled as:
-        // - If path starts with http://, https://, or file:// → uses URL(string: path)
-        // - Otherwise → treats as relative path, appends to caches directory
-        // The error occurs when audioRecorder.record() returns false
-        // Let's try the simplest approach: use just filename (saves to caches)
+        // iOS: Record as Linear PCM (WAV format) for Vosk
         const timestamp = Date.now();
-        path = `note_${timestamp}.m4a`;
+        path = `note_${timestamp}.wav`;
         
-        // Minimal iOS configuration - just format and quality
         audioSet = {
-          AVFormatIDKeyIOS: 'aac' as const,
+          AVFormatIDKeyIOS: 'lpcm' as const, // Linear PCM
+          AVSampleRateKeyIOS: 16000, // 16kHz for Vosk
+          AVNumberOfChannelsKeyIOS: 1, // Mono
+          AVLinearPCMBitDepthKeyIOS: 16, // 16-bit
+          AVLinearPCMIsBigEndianKeyIOS: false, // Little endian
+          AVLinearPCMIsFloatKeyIOS: false, // Integer PCM
           AVEncoderAudioQualityKeyIOS: AVEncoderAudioQualityIOSType.high,
         };
       }
@@ -180,11 +187,109 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
         console.error('AudioRecorderPlayer not available');
         return;
       }
-      await player.stopRecorder();
+      const result = await player.stopRecorder();
       player.removeRecordBackListener();
       setIsRecording(false);
+      
+      // Get the actual file path
+      // stopRecorder() returns the file path as a string
+      let finalPath = result || audioPath;
+      
+      // Ensure we have a valid path
+      if (finalPath) {
+        // Remove any file:// prefix that might be added
+        finalPath = finalPath.replace(/^file:\/\//, '');
+        // Fix double slashes at the start
+        finalPath = finalPath.replace(/^\/+/, '/');
+        setAudioPath(finalPath);
+        console.log('Recording stopped. File path:', finalPath);
+        
+        // Automatically transcribe after recording stops
+        await transcribeAudio(finalPath);
+      } else {
+        console.error('No audio path available after stopping recording');
+        Alert.alert('Error', 'Could not determine audio file path');
+      }
     } catch (error) {
       console.error('Error stopping recording:', error);
+    }
+  };
+
+  const transcribeAudio = async (audioFilePath: string) => {
+    setIsTranscribing(true);
+    setTranscription(null);
+    setTranscriptionError(null);
+
+    try {
+      // Import native module dynamically
+      const { NativeModules } = await import('react-native');
+      const VoskFileRecognition = NativeModules.VoskFileRecognition;
+
+      if (!VoskFileRecognition) {
+        throw new Error('Vosk native module not found. Please rebuild the app.');
+      }
+
+      // Model path in assets/bundle
+      const modelPath = 'model-en-us-0.15';
+
+      console.log('Starting transcription...');
+      console.log('Audio file:', audioFilePath);
+      console.log('Model path:', modelPath);
+
+      // Clean up file path - remove file:// prefix if present
+      let cleanAudioPath = audioFilePath;
+      if (cleanAudioPath.startsWith('file://')) {
+        cleanAudioPath = cleanAudioPath.replace(/^file:\/\/+/, '');
+      }
+      // Fix double slashes at the start (e.g., //storage -> /storage)
+      cleanAudioPath = cleanAudioPath.replace(/^\/+/, '/');
+
+      console.log('Cleaned audio path:', cleanAudioPath);
+
+      // Verify file exists before attempting transcription
+      const fileExists = await RNFS.exists(cleanAudioPath);
+      console.log('Audio file exists:', fileExists);
+      
+      if (!fileExists) {
+        throw new Error(`Audio file not found at: ${cleanAudioPath}`);
+      }
+
+      // Get file info for debugging
+      const fileInfo = await RNFS.stat(cleanAudioPath);
+      console.log('Audio file info:', {
+        size: fileInfo.size,
+        path: fileInfo.path,
+        isFile: fileInfo.isFile(),
+      });
+
+      // Call native module to transcribe
+      console.log('Calling native transcription module...');
+      const result = await VoskFileRecognition.transcribeFile(cleanAudioPath, modelPath);
+      
+      console.log('Transcription result received:', result);
+
+      if (result && result.text) {
+        const transcribedText = result.text.trim();
+        if (transcribedText.length > 0) {
+          setTranscription(transcribedText);
+          console.log('Transcription successful:', transcribedText);
+        } else {
+          console.warn('Transcription returned empty text');
+          setTranscription('No speech detected in the recording.');
+        }
+      } else if (result && result.error) {
+        throw new Error(result.error);
+      } else {
+        console.warn('Transcription returned no result or empty text');
+        setTranscription('No speech detected in the recording.');
+      }
+    } catch (error: any) {
+      console.error('Transcription error:', error);
+      const errorMessage = error?.message || 'Failed to transcribe audio. Please try again.';
+      setTranscriptionError(errorMessage);
+      Alert.alert('Transcription Error', errorMessage);
+    } finally {
+      setIsTranscribing(false);
     }
   };
 
@@ -231,9 +336,28 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
           </TouchableOpacity>
         )}
 
+        {isTranscribing && (
+          <View style={styles.transcribingContainer}>
+            <Text style={styles.transcribingText}>🔄 Transcribing audio...</Text>
+          </View>
+        )}
+
+        {transcription && (
+          <View style={styles.transcriptionContainer}>
+            <Text style={styles.transcriptionLabel}>📝 Transcription:</Text>
+            <Text style={styles.transcriptionText}>{transcription}</Text>
+          </View>
+        )}
+
+        {transcriptionError && (
+          <View style={styles.errorContainer}>
+            <Text style={styles.errorText}>❌ {transcriptionError}</Text>
+          </View>
+        )}
+
         {audioPath && (
           <Text style={styles.pathText} numberOfLines={2}>
-            Saved at: {audioPath}
+            💾 Saved at: {audioPath}
           </Text>
         )}
       </View>
@@ -281,6 +405,52 @@ const styles = StyleSheet.create({
     marginTop: 16,
     fontSize: 12,
     color: '#6b7280',
+    textAlign: 'center',
+  },
+  transcribingContainer: {
+    marginTop: 20,
+    padding: 16,
+    backgroundColor: '#f0f9ff',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#bae6fd',
+    alignItems: 'center',
+  },
+  transcribingText: {
+    fontSize: 14,
+    color: '#0369a1',
+    fontWeight: '500',
+  },
+  transcriptionContainer: {
+    marginTop: 20,
+    padding: 16,
+    backgroundColor: '#f0fdf4',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#86efac',
+  },
+  transcriptionLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#166534',
+    marginBottom: 8,
+  },
+  transcriptionText: {
+    fontSize: 16,
+    color: '#15803d',
+    lineHeight: 24,
+  },
+  errorContainer: {
+    marginTop: 20,
+    padding: 16,
+    backgroundColor: '#fef2f2',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#fecaca',
+  },
+  errorText: {
+    fontSize: 14,
+    color: '#991b1b',
     textAlign: 'center',
   },
 });

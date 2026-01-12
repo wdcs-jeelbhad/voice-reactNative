@@ -84,6 +84,18 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        
+        // Ensure native libraries are included
+        ndk {
+            abiFilters "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
+        }
+    }
+    
+    // Configure source sets to include native libraries
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
     }
     signingConfigs {
         debug {
@@ -105,6 +117,15 @@ android {
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
+    
+    // Packaging options to ensure native libraries are included
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+        pickFirst 'lib/*/libjnidispatch.so'
+        pickFirst 'lib/*/libvosk.so'
+    }
 }
 
 dependencies {
@@ -116,4 +137,13 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    // Vosk dependencies for offline speech recognition
+    implementation('com.alphacephei:vosk-android:0.3.45')
+    
+    // JNA - Use version that works better with Android
+    // Note: JNA native libraries are included in the JAR and extracted at runtime
+    // If you still get libjnidispatch.so errors, you may need to manually extract
+    // native libraries from JNA JAR to src/main/jniLibs/<arch>/libjnidispatch.so
+    implementation('net.java.dev.jna:jna:5.13.0')
 }
