@@ -224,8 +224,10 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
     setTranscription(null);
     setTranscriptionError(null);
 
+    const startTime = Date.now();
+
     try {
-      // Import native module dynamically
+      // Import native module dynamically (lazy load for better initial performance)
       const { NativeModules } = await import('react-native');
       const VoskFileRecognition = NativeModules.VoskFileRecognition;
 
@@ -250,7 +252,7 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
 
       console.log('Cleaned audio path:', cleanAudioPath);
 
-      // Verify file exists before attempting transcription
+      // Verify file exists before attempting transcription (async check)
       const fileExists = await RNFS.exists(cleanAudioPath);
       console.log('Audio file exists:', fileExists);
       
@@ -258,18 +260,22 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
         throw new Error(`Audio file not found at: ${cleanAudioPath}`);
       }
 
-      // Get file info for debugging
-      const fileInfo = await RNFS.stat(cleanAudioPath);
-      console.log('Audio file info:', {
-        size: fileInfo.size,
-        path: fileInfo.path,
-        isFile: fileInfo.isFile(),
-      });
+      // Get file info for debugging (only in dev mode for performance)
+      if (__DEV__) {
+        const fileInfo = await RNFS.stat(cleanAudioPath);
+        console.log('Audio file info:', {
+          size: fileInfo.size,
+          path: fileInfo.path,
+          isFile: fileInfo.isFile(),
+        });
+      }
 
-      // Call native module to transcribe
+      // Call native module to transcribe (runs in background thread)
       console.log('Calling native transcription module...');
       const result = await VoskFileRecognition.transcribeFile(cleanAudioPath, modelPath);
       
+      const transcriptionTime = Date.now() - startTime;
+      console.log(`Transcription completed in ${transcriptionTime}ms`);
       console.log('Transcription result received:', result);
 
       if (result && result.text) {
@@ -284,11 +290,11 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
             if (prevText.trim().length === 0) {
               return transcribedText;
             }
-            // Append with proper spacing
-            return `${prevText} ${transcribedText}`;
+            // Append with proper spacing and newline for better readability
+            return `${prevText}\n\n${transcribedText}`;
           });
           
-          // Focus the text input to show the new transcription
+          // Focus the text input to show the new transcription (debounced)
           setTimeout(() => {
             textInputRef.current?.focus();
           }, 100);
@@ -306,7 +312,10 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
       console.error('Transcription error:', error);
       const errorMessage = error?.message || 'Failed to transcribe audio. Please try again.';
       setTranscriptionError(errorMessage);
-      Alert.alert('Transcription Error', errorMessage);
+      // Only show alert for critical errors, not for empty transcriptions
+      if (!errorMessage.includes('No speech detected')) {
+        Alert.alert('Transcription Error', errorMessage);
+      }
     } finally {
       setIsTranscribing(false);
     }
@@ -365,7 +374,8 @@ function Notes({}: RootScreenProps<Paths.Notes>) {
           {/* Status Messages */}
           {isTranscribing && (
             <View style={styles.transcribingContainer}>
-              <Text style={styles.transcribingText}>🔄 Transcribing audio...</Text>
+              <Text style={styles.transcribingText}>🔄 Processing audio transcription...</Text>
+              <Text style={styles.transcribingSubtext}>This may take a few seconds</Text>
             </View>
           )}
 
@@ -484,6 +494,12 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#0369a1',
     fontWeight: '500',
+    marginBottom: 4,
+  },
+  transcribingSubtext: {
+    fontSize: 12,
+    color: '#0284c7',
+    fontStyle: 'italic',
   },
   textInputContainer: {
     flex: 1,

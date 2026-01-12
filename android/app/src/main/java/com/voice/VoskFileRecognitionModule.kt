@@ -4,12 +4,15 @@ import android.content.res.AssetManager
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import com.facebook.react.bridge.*
 import org.vosk.Model
 import org.vosk.Recognizer
 import java.io.*
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicBoolean
 
 class VoskFileRecognitionModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
@@ -17,6 +20,13 @@ class VoskFileRecognitionModule(reactContext: ReactApplicationContext) :
     companion object {
         private const val TAG = "VoskFileRecognition"
         private const val SAMPLE_RATE = 16000.0f
+        private const val CHUNK_SIZE = 8000 // Increased from 4096 for better performance
+        private const val MAX_WORDS = 10000 // Limit words for better performance
+        
+        // Shared model instance (cached across calls)
+        @Volatile
+        private var sharedModel: Model? = null
+        private val modelLock = Any()
         
         init {
             // Initialize JNA native library loading
@@ -31,8 +41,9 @@ class VoskFileRecognitionModule(reactContext: ReactApplicationContext) :
         }
     }
 
-    private var model: Model? = null
     private var recognizer: Recognizer? = null
+    private val backgroundThread = HandlerThread("VoskTranscriptionThread").apply { start() }
+    private val backgroundHandler = Handler(backgroundThread.looper)
 
     override fun getName(): String {
         return "VoskFileRecognition"
@@ -40,114 +51,122 @@ class VoskFileRecognitionModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun transcribeFile(audioFilePath: String, modelPath: String, promise: Promise) {
-        try {
-            Log.d(TAG, "Starting transcription for: $audioFilePath")
-            Log.d(TAG, "Using model: $modelPath")
+        // Process in background thread for better performance
+        backgroundHandler.post {
+            try {
+                Log.d(TAG, "Starting transcription for: $audioFilePath")
+                Log.d(TAG, "Using model: $modelPath")
 
-            // Load model from assets
-            val modelLoaded = loadModel(modelPath)
-            if (!modelLoaded) {
-                promise.reject("MODEL_ERROR", "Failed to load Vosk model from assets. Check if model-en-us-0.15 exists in assets folder.")
-                return
-            }
-            
-            if (model == null) {
-                promise.reject("MODEL_ERROR", "Model loaded but instance is null")
-                return
-            }
-            
-            Log.d(TAG, "Model loaded successfully")
-
-            // Read and convert audio file to PCM
-            Log.d(TAG, "Attempting to read audio file: $audioFilePath")
-            val pcmData = readAudioFile(audioFilePath)
-            if (pcmData == null || pcmData.isEmpty()) {
-                val errorMsg = "Failed to read or convert audio file: $audioFilePath. Check logs for details."
-                Log.e(TAG, errorMsg)
-                promise.reject("AUDIO_ERROR", errorMsg)
-                return
-            }
-
-            Log.d(TAG, "Audio data size: ${pcmData.size} bytes")
-            Log.d(TAG, "Expected duration: ${pcmData.size / (SAMPLE_RATE * 2)} seconds") // 16-bit = 2 bytes per sample
-
-            // Create recognizer
-            recognizer = Recognizer(model, SAMPLE_RATE)
-            recognizer?.setWords(true)
-            recognizer?.setPartialWords(true)
-            
-            Log.d(TAG, "Recognizer created successfully")
-
-            // Process audio in chunks
-            val chunkSize = 4096
-            var offset = 0
-            var partialResults = mutableListOf<String>()
-            var chunksProcessed = 0
-
-            Log.d(TAG, "Starting to process ${pcmData.size} bytes in chunks of $chunkSize")
-
-            while (offset < pcmData.size) {
-                val chunkEnd = minOf(offset + chunkSize, pcmData.size)
-                val chunk = pcmData.copyOfRange(offset, chunkEnd)
-
-                // Process chunk through Vosk
-                val accepted = recognizer?.acceptWaveForm(chunk, chunk.size) == true
+                // Get or load model (cached)
+                val model = getOrLoadModel(modelPath)
+                if (model == null) {
+                    promise.reject("MODEL_ERROR", "Failed to load Vosk model from assets. Check if model-en-us-0.15 exists in assets folder.")
+                    return@post
+                }
                 
-                if (accepted) {
-                    val result = recognizer?.result
-                    if (result != null) {
-                        val text = extractTextFromJson(result)
-                        if (text.isNotEmpty()) {
-                            partialResults.add(text)
-                            Log.d(TAG, "Partial result [$chunksProcessed]: $text")
-                        }
+                Log.d(TAG, "Model ready (cached or loaded)")
+
+                // Read and convert audio file to PCM
+                Log.d(TAG, "Attempting to read audio file: $audioFilePath")
+                val pcmData = readAudioFile(audioFilePath)
+                if (pcmData == null || pcmData.isEmpty()) {
+                    val errorMsg = "Failed to read or convert audio file: $audioFilePath. Check logs for details."
+                    Log.e(TAG, errorMsg)
+                    promise.reject("AUDIO_ERROR", errorMsg)
+                    return@post
+                }
+
+                Log.d(TAG, "Audio data size: ${pcmData.size} bytes")
+                val duration = pcmData.size / (SAMPLE_RATE * 2) // 16-bit = 2 bytes per sample
+                Log.d(TAG, "Expected duration: $duration seconds")
+
+                // Normalize audio for better accuracy
+                val normalizedPCM = normalizeAudio(pcmData)
+                Log.d(TAG, "Audio normalized")
+
+                // Create recognizer with optimized settings
+                recognizer = Recognizer(model, SAMPLE_RATE)
+                recognizer?.setWords(true)
+                recognizer?.setPartialWords(false) // Disable partial words for better performance
+                recognizer?.setMaxAlternatives(0) // No alternatives for speed
+                
+                Log.d(TAG, "Recognizer created with optimized settings")
+
+                // Process audio in larger chunks for better performance
+                var offset = 0
+                var chunksProcessed = 0
+                val totalChunks = (normalizedPCM.size + CHUNK_SIZE - 1) / CHUNK_SIZE
+
+                Log.d(TAG, "Starting to process ${normalizedPCM.size} bytes in chunks of $CHUNK_SIZE (total: ~$totalChunks chunks)")
+
+                while (offset < normalizedPCM.size) {
+                    val chunkEnd = minOf(offset + CHUNK_SIZE, normalizedPCM.size)
+                    val chunk = normalizedPCM.copyOfRange(offset, chunkEnd)
+
+                    // Process chunk through Vosk
+                    recognizer?.acceptWaveForm(chunk, chunk.size)
+                    
+                    chunksProcessed++
+                    offset = chunkEnd
+                    
+                    // Log progress every 20 chunks (less frequent logging for performance)
+                    if (chunksProcessed % 20 == 0) {
+                        val progress = (offset * 100 / normalizedPCM.size)
+                        Log.d(TAG, "Processed $chunksProcessed/$totalChunks chunks ($progress%)")
                     }
                 }
+
+                Log.d(TAG, "Finished processing all chunks. Total chunks: $chunksProcessed")
+
+                // Get final result - this is crucial!
+                val finalResultJson = recognizer?.finalResult
+                Log.d(TAG, "Final result JSON: $finalResultJson")
                 
-                chunksProcessed++
-                offset = chunkEnd
-                
-                // Log progress every 10 chunks
-                if (chunksProcessed % 10 == 0) {
-                    Log.d(TAG, "Processed $chunksProcessed chunks (${offset * 100 / pcmData.size}%)")
+                var finalResult = ""
+                if (finalResultJson != null && finalResultJson.isNotEmpty()) {
+                    finalResult = extractTextFromJson(finalResultJson)
+                    Log.d(TAG, "Final result text: '$finalResult'")
+                } else {
+                    Log.w(TAG, "Final result is null or empty")
                 }
+
+                // Cleanup
+                recognizer?.close()
+                recognizer = null
+
+                // Post-process result for better accuracy
+                val processedResult = postProcessTranscription(finalResult)
+
+                // Return result
+                val resultMap = Arguments.createMap()
+                resultMap.putString("text", processedResult)
+                
+                Log.d(TAG, "Returning transcription result: '$processedResult' (length: ${processedResult.length})")
+                promise.resolve(resultMap)
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Transcription error", e)
+                promise.reject("TRANSCRIPTION_ERROR", e.message ?: "Unknown error", e)
             }
-
-            Log.d(TAG, "Finished processing all chunks. Total chunks: $chunksProcessed")
-
-            // Always get final result - this is crucial!
-            val finalResultJson = recognizer?.finalResult
-            Log.d(TAG, "Final result JSON: $finalResultJson")
-            
-            var finalResult = ""
-            if (finalResultJson != null && finalResultJson.isNotEmpty()) {
-                finalResult = extractTextFromJson(finalResultJson)
-                Log.d(TAG, "Final result text: '$finalResult'")
-            } else {
-                Log.w(TAG, "Final result is null or empty")
+        }
+    }
+    
+    private fun getOrLoadModel(modelPath: String): Model? {
+        // Check if model is already loaded
+        synchronized(modelLock) {
+            if (sharedModel != null) {
+                Log.d(TAG, "Using cached model instance")
+                return sharedModel
             }
             
-            // If no final result, check if we have partial results
-            if (finalResult.isEmpty() && partialResults.isNotEmpty()) {
-                finalResult = partialResults.last()
-                Log.d(TAG, "Using last partial result: '$finalResult'")
+            // Load model
+            val modelLoaded = loadModel(modelPath)
+            if (modelLoaded && sharedModel != null) {
+                Log.d(TAG, "Model loaded and cached")
+                return sharedModel
             }
-
-            // Cleanup
-            recognizer?.close()
-            recognizer = null
-
-            // Return result (even if empty, so we know it processed)
-            val resultMap = Arguments.createMap()
-            val resultText = finalResult.trim()
-            resultMap.putString("text", resultText)
             
-            Log.d(TAG, "Returning transcription result: '$resultText' (length: ${resultText.length})")
-            promise.resolve(resultMap)
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Transcription error", e)
-            promise.reject("TRANSCRIPTION_ERROR", e.message ?: "Unknown error", e)
+            return null
         }
     }
 
@@ -195,8 +214,10 @@ class VoskFileRecognitionModule(reactContext: ReactApplicationContext) :
             }
 
             Log.d(TAG, "Loading Vosk model from: ${modelDir.absolutePath}")
-            model = Model(modelDir.absolutePath)
-            Log.d(TAG, "Model loaded successfully! Model instance: $model")
+            synchronized(modelLock) {
+                sharedModel = Model(modelDir.absolutePath)
+                Log.d(TAG, "Model loaded successfully! Model instance: $sharedModel")
+            }
             true
         } catch (e: Exception) {
             Log.e(TAG, "Error loading model", e)
@@ -571,47 +592,121 @@ class VoskFileRecognitionModule(reactContext: ReactApplicationContext) :
     
     private fun resampleAudio(pcmData: ByteArray, inputSampleRate: Int, inputChannels: Int, 
                               outputSampleRate: Int, outputChannels: Int): ByteArray {
-        // For now, if sample rate doesn't match, log warning and return original
-        // Proper resampling requires a library like libsamplerate or similar
-        // Vosk can handle some sample rate variations, so we'll try with original data
-        if (inputSampleRate != outputSampleRate) {
-            Log.w(TAG, "Sample rate mismatch: $inputSampleRate Hz -> $outputSampleRate Hz. Using original (may cause issues).")
-        }
+        // Simple linear resampling for sample rate conversion
+        var processedData = pcmData
         
-        // Convert to mono if needed (simple average of channels)
+        // First convert to mono if needed
         if (inputChannels > 1 && outputChannels == 1) {
             Log.d(TAG, "Converting from $inputChannels channels to mono")
-            val inputSamples = pcmData.size / (2 * inputChannels) // 16-bit = 2 bytes per sample
-            val output = ByteArray(inputSamples * 2) // mono = 1 channel, 16-bit = 2 bytes per sample
+            val inputSamples = pcmData.size / (2 * inputChannels)
+            val monoData = ByteArray(inputSamples * 2)
             
             for (i in 0 until inputSamples) {
                 var sum = 0
                 for (ch in 0 until inputChannels) {
                     val sampleIdx = i * 2 * inputChannels + ch * 2
                     if (sampleIdx + 1 < pcmData.size) {
-                        // Read 16-bit little-endian sample
                         val sample = (pcmData[sampleIdx].toInt() and 0xFF) or 
                                     ((pcmData[sampleIdx + 1].toInt() and 0xFF) shl 8)
-                        // Convert unsigned to signed
                         val signedSample = if (sample > 32767) sample - 65536 else sample
                         sum += signedSample
                     }
                 }
-                // Average channels
                 val avg = (sum / inputChannels).coerceIn(-32768, 32767)
-                // Write as 16-bit little-endian
-                output[i * 2] = (avg and 0xFF).toByte()
-                output[i * 2 + 1] = ((avg shr 8) and 0xFF).toByte()
+                monoData[i * 2] = (avg and 0xFF).toByte()
+                monoData[i * 2 + 1] = ((avg shr 8) and 0xFF).toByte()
             }
-            
-            Log.d(TAG, "Converted to mono: ${output.size} bytes")
-            return output
+            processedData = monoData
+            Log.d(TAG, "Converted to mono: ${processedData.size} bytes")
         }
         
-        // No conversion needed
-        return pcmData
+        // Resample if sample rate differs
+        if (inputSampleRate != outputSampleRate) {
+            Log.d(TAG, "Resampling from $inputSampleRate Hz to $outputSampleRate Hz")
+            val ratio = inputSampleRate.toDouble() / outputSampleRate.toDouble()
+            val inputSamples = processedData.size / 2
+            val outputSamples = (inputSamples / ratio).toInt()
+            val resampledData = ByteArray(outputSamples * 2)
+            
+            for (i in 0 until outputSamples) {
+                val srcIndex = (i * ratio).toInt()
+                if (srcIndex * 2 + 1 < processedData.size) {
+                    resampledData[i * 2] = processedData[srcIndex * 2]
+                    resampledData[i * 2 + 1] = processedData[srcIndex * 2 + 1]
+                }
+            }
+            processedData = resampledData
+            Log.d(TAG, "Resampled: ${processedData.size} bytes")
+        }
+        
+        return processedData
     }
 
+    private fun normalizeAudio(pcmData: ByteArray): ByteArray {
+        // Simple audio normalization to improve accuracy
+        // This helps with quiet recordings and improves recognition
+        val samples = ShortArray(pcmData.size / 2)
+        
+        // Convert bytes to samples
+        for (i in samples.indices) {
+            val low = pcmData[i * 2].toInt() and 0xFF
+            val high = (pcmData[i * 2 + 1].toInt() and 0xFF) shl 8
+            var sample = (low or high).toShort()
+            // Convert unsigned to signed
+            if (sample > 32767) sample = (sample.toInt() - 65536).toShort()
+            samples[i] = sample
+        }
+        
+        // Find max amplitude for normalization
+        var maxAmplitude = 0
+        for (sample in samples) {
+            val abs = kotlin.math.abs(sample.toInt())
+            if (abs > maxAmplitude) maxAmplitude = abs
+        }
+        
+        // Normalize if needed (only if max is less than 80% of max range)
+        if (maxAmplitude > 0 && maxAmplitude < 26214) { // 80% of 32767
+            val gainFactor = 26214.0 / maxAmplitude // Target 80% of max
+            for (i in samples.indices) {
+                val normalized = (samples[i].toInt() * gainFactor).toInt().coerceIn(-32768, 32767)
+                samples[i] = normalized.toShort()
+            }
+            Log.d(TAG, "Audio normalized with gain factor: $gainFactor")
+        }
+        
+        // Convert back to bytes
+        val normalizedBytes = ByteArray(pcmData.size)
+        for (i in samples.indices) {
+            val sample = samples[i].toInt()
+            normalizedBytes[i * 2] = (sample and 0xFF).toByte()
+            normalizedBytes[i * 2 + 1] = ((sample shr 8) and 0xFF).toByte()
+        }
+        
+        return normalizedBytes
+    }
+    
+    private fun postProcessTranscription(text: String): String {
+        if (text.isEmpty()) return text
+        
+        var processed = text.trim()
+        
+        // Capitalize first letter of sentences
+        if (processed.isNotEmpty()) {
+            processed = processed[0].uppercaseChar() + processed.substring(1)
+        }
+        
+        // Add period at end if missing
+        if (processed.isNotEmpty() && !processed.endsWith('.') && 
+            !processed.endsWith('!') && !processed.endsWith('?')) {
+            processed += "."
+        }
+        
+        // Remove extra spaces
+        processed = processed.replace(Regex("\\s+"), " ")
+        
+        return processed.trim()
+    }
+    
     private fun extractTextFromJson(jsonString: String): String {
         return try {
             val jsonObject = org.json.JSONObject(jsonString)
